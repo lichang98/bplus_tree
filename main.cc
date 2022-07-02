@@ -60,6 +60,12 @@ enum class NodeType {
   ROOT_LEAF = 5
 };
 
+constexpr u16 _node_max_cap = 3;
+
+constexpr bool too_few(u32 n) { return n < (_node_max_cap / 2); }
+
+constexpr bool too_much(u32 n) { return n > (_node_max_cap); }
+
 template <typename Key, typename Val>
 requires NodeCpt<Key, Val>
 class BPlusTNode {
@@ -76,6 +82,16 @@ public:
     return i;
   }
 
+  u32 find_pos_low(Key &key) {
+    u32 i = _keys.size() - 1;
+    for (; i < _keys.size(); --i) {
+      if (key >= _keys[i]) {
+        break;
+      }
+    }
+    return i;
+  }
+
   u32 find_pos_exact(Key &key) {
     u32 i = 0;
     for (; i < _keys.size(); ++i) {
@@ -83,7 +99,7 @@ public:
         break;
       }
     }
-    return (i == _keys.size() ? -1 : i);
+    return i;
   }
 
   void leaf_insert(Key &key, Val &val, u32 pos) {
@@ -114,6 +130,9 @@ public:
     } else {
       other->_fields.insert(other->_fields.begin(),
                             _fields.begin() + beg_pos + 1, _fields.end());
+      for (u32 pos = 0; pos < other->_fields.size(); ++pos) {
+        std::get<root_type_t<Key, Val>>(other->_fields[pos])->_parent = other;
+      }
       _fields.erase(_fields.begin() + beg_pos + 1, _fields.end());
     }
   }
@@ -121,18 +140,28 @@ public:
   // Only for leaf node
   void move_left_half(std::shared_ptr<BPlusTNode<Key, Val>> other,
                       u32 end_pos) {
-    assert(_type == NodeType::LEAF && other->_type == NodeType::LEAF);
     other->_keys.insert(other->_keys.end(), _keys.begin(),
                         _keys.begin() + end_pos);
-    other->_fields.insert(other->_fields.end(), _fields.begin(),
-                          _fields.begin() + end_pos);
     _keys.erase(_keys.begin(), _keys.begin() + end_pos);
-    _fields.erase(_fields.begin(), _fields.begin() + end_pos);
+    if (static_cast<u32>(_type) & static_cast<u32>(NodeType::LEAF)) {
+      other->_fields.insert(other->_fields.end(), _fields.begin(),
+                            _fields.begin() + end_pos);
+      _fields.erase(_fields.begin(), _fields.begin() + end_pos);
+    } else {
+      other->_fields.insert(other->_fields.end(), _fields.begin(),
+                            _fields.begin() + end_pos + 1);
+      for (u32 pos = 0; pos < other->_fields.size(); ++pos) {
+        std::get<root_type_t<Key, Val>>(other->_fields[pos])->_parent = other;
+      }
+      _fields.erase(_fields.begin(), _fields.begin() + end_pos + 1);
+    }
   }
 
   Key get_min() {
-    assert(!_keys.empty());
-    return _keys[0];
+    if (_keys.empty())
+      return _min_key;
+    else
+      return _keys[0];
   }
 
   void remove_min() {
@@ -161,13 +190,31 @@ public:
     }
   }
 
+  void update_split_key(Key old_key, Key new_key) {
+    assert(_type != NodeType::LEAF);
+    for (Key &k : _keys) {
+      if (k <= old_key) {
+        k = new_key;
+        break;
+      }
+    }
+  }
+
   bool remove(Key key, u32 *pos_rm) {
     u32 pos = find_pos_exact(key);
-    if (pos < 0) {
+    if (pos > _keys.size())
       return false;
-    }
     _keys.erase(_keys.begin() + pos);
     *pos_rm = pos;
+    return true;
+  }
+
+  void remove_key_by_pos(u32 pos) {
+    assert(pos < _keys.size());
+    if (_keys.size() == 1)
+      _min_key = _keys[0];
+
+    _keys.erase(_keys.begin() + pos);
   }
 
   void remove_fld_by_pos(u32 pos) {
@@ -184,6 +231,36 @@ public:
     return right_node;
   }
 
+  std::shared_ptr<BPlusTNode<Key, Val>> get_right_sib() {
+    assert(!(static_cast<u32>(_type) & static_cast<u32>(NodeType::ROOT)));
+    u32 pos = 0;
+    auto par = _parent.lock();
+    while (pos < par->_fields.size() &&
+           std::get<root_type_t<Key, Val>>(par->_fields[pos])->get_min() !=
+               get_min())
+      ++pos;
+    assert(pos < par->_fields.size());
+    if (pos == par->_fields.size() - 1)
+      return nullptr;
+    else
+      return std::get<root_type_t<Key, Val>>(par->_fields[pos + 1]);
+  }
+
+  std::shared_ptr<BPlusTNode<Key, Val>> get_left_sib() {
+    assert(!(static_cast<u32>(_type) & static_cast<u32>(NodeType::ROOT)));
+    u32 pos = 0;
+    auto par = _parent.lock();
+    while (pos < par->_fields.size() &&
+           std::get<root_type_t<Key, Val>>(par->_fields[pos])->get_min() !=
+               get_min())
+      ++pos;
+    assert(pos < par->_fields.size());
+    if (pos == 0)
+      return nullptr;
+    else
+      return std::get<root_type_t<Key, Val>>(par->_fields[pos - 1]);
+  }
+
   bool touch_low_limit() {
     return _keys.size() < static_cast<u32>(_node_max_cap / 2);
   }
@@ -197,27 +274,40 @@ public:
       for (; i < node._keys.size() - 1; ++i) {
         out << "[Key=" << node._keys[i]
             << ", Val=" << std::get<Val>(node._fields[i]) << "], ";
+        if (node._parent.lock()) {
+          out << ",,,parent key0=" << node._parent.lock()->_keys[0] << "  ";
+        }
       }
       out << "[Key=" << node._keys[i]
           << ", Val=" << std::get<Val>(node._fields[i]) << "]  ";
+      if (node._parent.lock()) {
+        out << ",,,parent key0=" << node._parent.lock()->_keys[0] << "  ";
+      }
       break;
     default:
       for (; i < node._keys.size() - 1; ++i) {
         out << "[Key=" << node._keys[i] << "], ";
+        if (node._parent.lock()) {
+          out << ",,,parent key0=" << node._parent.lock()->_keys[0] << "  ";
+        }
       }
       out << "[Key=" << node._keys[i] << "]  ";
+      if (node._parent.lock()) {
+        out << ",,,parent key0=" << node._parent.lock()->_keys[0] << "  ";
+      }
       break;
     }
+    out << " ###### ";
     return out;
   }
 
   std::weak_ptr<BPlusTNode> _parent;
   std::shared_ptr<BPlusTNode> _leaf_right;
+  std::shared_ptr<BPlusTNode> _leaf_left;
   std::vector<Key> _keys;
   node_fields_t<Key, Val> _fields;
+  Key _min_key;
   NodeType _type;
-
-  static constexpr u16 _node_max_cap = 3;
 };
 
 template <typename Key, typename Val>
@@ -229,6 +319,7 @@ public:
     _height = 0;
     _leaf_beg = _root;
   }
+
   void insert(Key key, Val val) {
     // When only root node
     if (_height == 0) {
@@ -245,6 +336,7 @@ public:
         left->move_right_half(right, left->_keys.size() / 2,
                               left->_type == NodeType::LEAF);
         left->_leaf_right = right;
+        right->_leaf_left = left;
         _leaf_beg = left;
         left->_parent = new_root;
         right->_parent = new_root;
@@ -279,6 +371,9 @@ public:
     std::shared_ptr<BPlusTNode<Key, Val>> right_leaf = p->split_right();
     right_leaf->_leaf_right = p->_leaf_right;
     p->_leaf_right = right_leaf;
+    right_leaf->_leaf_left = p;
+    if (right_leaf->_leaf_right)
+      right_leaf->_leaf_right->_leaf_left = right_leaf;
     Key right_min = right_leaf->get_min();
     std::shared_ptr<BPlusTNode<Key, Val>> par = p->_parent.lock();
     std::shared_ptr<field_type_t<Key, Val>> push_val =
@@ -301,7 +396,7 @@ public:
       par = p->_parent.lock();
     }
 
-    // Cascade split reaching root
+    // Cascade spliting reaches root
     if (p->touch_high_limit() && p == _root) {
       p->_type = NodeType::MIDDLE;
       auto right = std::make_shared<BPlusTNode<Key, Val>>(NodeType::MIDDLE);
@@ -319,19 +414,166 @@ public:
       ++_height;
     }
   }
-  void remove(Key key);
-  bool search(Key key);
+
+  void remove(Key key) {
+    Val val;
+    u32 pos;
+    std::shared_ptr<BPlusTNode<Key, Val>> p = search(key, val);
+    if (!p)
+      return;
+
+    if (p->_type == NodeType::ROOT_LEAF) {
+      bool exist = p->remove(key, &pos);
+      p->remove_fld_by_pos(pos);
+      if (p->_keys.empty()) {
+        _leaf_beg = nullptr;
+      }
+      return;
+    }
+
+    auto sib = p->get_right_sib();
+    bool is_right = true;
+    if (!sib) {
+      is_right = false;
+      sib = p->get_left_sib();
+    }
+
+    assert(sib);
+    Key right_min = is_right ? sib->get_min() : p->get_min();
+
+    bool exist = p->remove(key, &pos);
+    p->remove_fld_by_pos(pos);
+    if (!p->touch_low_limit())
+      return;
+    auto parent = p->_parent.lock();
+
+    while (p != _root && too_few(p->_keys.size())) {
+      // Redistribute
+      if (too_much(p->_keys.size() + sib->_keys.size())) {
+        u32 total_size = p->_keys.size() + sib->_keys.size();
+        u32 mv_size = sib->_keys.size() - total_size / 2 - (total_size % 2);
+        if (is_right) {
+          pos = parent->find_pos_low(right_min);
+          assert(pos < parent->_keys.size());
+          if (sib->_type != NodeType::LEAF) {
+            p->_keys.emplace_back(parent->_keys[pos]);
+          }
+          sib->move_left_half(p, mv_size);
+          parent->update_split_key(right_min, sib->get_min());
+          if (sib->_type != NodeType::LEAF) {
+            sib->_keys.erase(sib->_keys.begin());
+          }
+        } else {
+          pos = parent->find_pos_low(right_min);
+          assert(pos < parent->_keys.size());
+          if (sib->_type != NodeType::LEAF) {
+            sib->_keys.emplace_back(parent->_keys[pos]);
+          }
+          sib->move_right_half(p, total_size / 2, p->_type == NodeType::LEAF);
+          parent->update_split_key(right_min, p->get_min());
+          if (p->_type != NodeType::LEAF) {
+            p->_keys.erase(p->_keys.begin());
+          }
+        }
+      } else {
+        // Merge with sibling, remove from parent the split key,
+        // the removing may cascade
+        if (is_right) {
+          pos = parent->find_pos_low(right_min);
+          assert(pos < parent->_keys.size());
+          if (p->_type != NodeType::LEAF) {
+            p->_keys.emplace_back(parent->_keys[pos]);
+          }
+          parent->remove_key_by_pos(pos);
+          parent->remove_fld_by_pos(pos);
+          p->move_right_half(sib, 0, p->_type == NodeType::LEAF);
+          parent->update_split_key(right_min, sib->get_min());
+          if (p == _leaf_beg) {
+            _leaf_beg = sib;
+          } else {
+            if (p->_leaf_left) {
+              p->_leaf_left->_leaf_right = sib;
+            }
+            sib->_leaf_left = p->_leaf_left;
+          }
+        } else {
+          pos = parent->find_pos_low(right_min);
+          assert(pos < parent->_keys.size());
+          if (sib->_type != NodeType::LEAF) {
+            sib->_keys.emplace_back(parent->_keys[pos]);
+          }
+          parent->remove_key_by_pos(pos);
+          parent->remove_fld_by_pos(pos + 1);
+          p->move_left_half(sib, p->_keys.size());
+          parent->update_split_key(right_min, sib->get_min());
+
+          sib->_leaf_right = p->_leaf_right;
+          if (p->_leaf_right) {
+            p->_leaf_right->_leaf_left = sib;
+          }
+        }
+        if (parent == _root && parent->_keys.empty()) {
+          _root = sib;
+          _root->_parent.reset();
+          std::cout << "reset root, key size=" << _root->_keys.size()
+                    << ", key0=" << _root->_keys[0]
+                    << ", node type=" << (_root->_type == NodeType::LEAF)
+                    << std::endl;
+          _root->_type = _root->_type == NodeType::LEAF ? NodeType::ROOT_LEAF
+                                                        : NodeType::ROOT;
+          --_height;
+          break;
+        }
+      }
+      p = parent;
+      parent = p->_parent.lock();
+      if (p != _root) {
+        sib = p->get_right_sib();
+        is_right = true;
+        if (!sib) {
+          is_right = false;
+          sib = p->get_left_sib();
+        }
+
+        assert(sib);
+        right_min = is_right ? sib->get_min() : p->get_min();
+      }
+    }
+  }
+
+  root_type_t<Key, Val> search(Key key, Val &ret_val) {
+    std::shared_ptr<BPlusTNode<Key, Val>> p = _root;
+    while (p &&
+           !(static_cast<u32>(p->_type) & static_cast<u32>(NodeType::LEAF))) {
+      u32 pos = p->find_pos(key);
+      assert(pos < p->_fields.size());
+      p = std::get<root_type_t<Key, Val>>(p->_fields[pos]);
+    }
+    assert(p);
+    u32 pos = p->find_pos_exact(key);
+    if (pos >= p->_keys.size())
+      return nullptr;
+    ret_val = std::get<Val>(p->_fields[pos]);
+    return p;
+  }
 
   void visit_leaves() {
     std::shared_ptr<BPlusTNode<Key, Val>> p = _leaf_beg;
+    if (!p) {
+      std::cout << " --- " << std::endl;
+    }
     while (p) {
-      std::cout << *p << " --- ";
+      std::cout << *p;
       p = p->_leaf_right;
     }
     std::cout << std::endl;
   }
 
   void level_visit() {
+    if (_root->_keys.empty()) {
+      std::cout << "[ ]" << std::endl;
+      return;
+    }
     std::queue<std::shared_ptr<BPlusTNode<Key, Val>>> que;
     que.push(_root);
     u32 i = 1;
@@ -339,7 +581,8 @@ public:
     splits.push(1);
     u32 j = 0;
     while (!que.empty()) {
-      if (que.front()->_type != NodeType::LEAF) {
+      if (!(static_cast<u32>(que.front()->_type) &
+            static_cast<u32>(NodeType::LEAF))) {
         splits.push(que.front()->_fields.size());
         for (auto child : que.front()->_fields) {
           que.push(std::get<std::shared_ptr<BPlusTNode<Key, Val>>>(child));
@@ -368,30 +611,52 @@ public:
 int main(int argc, char **argv) {
   BPlusTree<u32, u32> tree;
 
+  u32 val;
+
   std::cout << "insert 1,2001" << std::endl;
   tree.insert(1, 2001);
 
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "insert 2,2404" << std::endl;
   tree.insert(2, 2404);
 
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
 
   std::cout << "insert 4,99187" << std::endl;
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   tree.insert(4, 99187);
 
+  auto ret = tree.search(1, val);
+  assert(ret && val == 2001);
+
+  ret = tree.search(-1, val);
+  assert(!ret);
+
+  ret = tree.search(5, val);
+  assert(!ret);
+
+  ret = tree.search(4, val);
+  assert(ret && val == 99187);
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
 
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "insert 5,88177" << std::endl;
   tree.insert(5, 88177);
 
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
 
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "level vis" << std::endl;
   tree.level_visit();
 
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "level vis" << std::endl;
   std::cout << "insert 3,10000" << std::endl;
   tree.insert(3, 10000);
@@ -399,6 +664,7 @@ int main(int argc, char **argv) {
   std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
 
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "level vis" << std::endl;
   std::cout << "insert 0,40000" << std::endl;
   tree.insert(0, 40000);
@@ -406,6 +672,7 @@ int main(int argc, char **argv) {
   std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
 
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "level vis" << std::endl;
   std::cout << "insert 9,90000" << std::endl;
   tree.insert(9, 90000);
@@ -413,6 +680,7 @@ int main(int argc, char **argv) {
   std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
 
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "level vis" << std::endl;
   std::cout << "insert 7,70000" << std::endl;
   tree.insert(7, 70000);
@@ -420,6 +688,7 @@ int main(int argc, char **argv) {
   std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
 
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "level vis" << std::endl;
   std::cout << "insert 8,80000" << std::endl;
   tree.insert(8, 80000);
@@ -427,6 +696,7 @@ int main(int argc, char **argv) {
   std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
 
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "level vis" << std::endl;
   std::cout << "insert 6,60000" << std::endl;
   tree.insert(6, 60000);
@@ -434,11 +704,219 @@ int main(int argc, char **argv) {
   std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
 
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
   std::cout << "level vis" << std::endl;
   std::cout << "insert 11,110000" << std::endl;
   tree.insert(11, 110000);
   tree.level_visit();
   std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
+
+  std::cout << "tree root key size=" << tree._root->_keys.size()
+            << ", key 0 = " << tree._root->_keys[0]
+            << ", tree height=" << tree._height << std::endl;
+  val = 0;
+  ret = tree.search(11, val);
+  assert(ret && val == 110000);
+  ret = tree.search(1, val);
+  assert(ret && val == 2001);
+  ret = tree.search(2, val);
+  assert(ret && val == 2404);
+  ret = tree.search(3, val);
+  assert(ret && val == 10000);
+  ret = tree.search(0, val);
+  assert(ret && val == 40000);
+  ret = tree.search(9, val);
+  assert(ret && val == 90000);
+  ret = tree.search(7, val);
+  assert(ret && val == 70000);
+  ret = tree.search(8, val);
+  assert(ret && val == 80000);
+  ret = tree.search(6, val);
+  assert(ret && val == 60000);
+  ret = tree.search(123, val);
+  assert(!ret);
+  ret = tree.search(-2, val);
+  assert(!ret);
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "remove key=4" << std::endl;
+  tree.remove(4);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "remove key=6" << std::endl;
+  tree.remove(6);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "remove key=5" << std::endl;
+  tree.remove(5);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "remove key=11" << std::endl;
+  tree.remove(11);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "remove key=9" << std::endl;
+  tree.remove(9);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "remove key=8" << std::endl;
+  tree.remove(8);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "remove key=7" << std::endl;
+  tree.remove(7);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+  std::cout << "tree root key size=" << tree._root->_keys.size()
+            << ", key 0 = " << tree._root->_keys[0]
+            << ", tree height=" << tree._height << std::endl;
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+
+  std::cout << "remove key=0" << std::endl;
+  tree.remove(0);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "remove key=1" << std::endl;
+  tree.remove(1);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "remove key=2" << std::endl;
+  tree.remove(2);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "remove key=3" << std::endl;
+  tree.remove(3);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "insert 1,2001" << std::endl;
+  tree.insert(1, 2001);
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "insert 2,2404" << std::endl;
+  tree.insert(2, 2404);
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "insert 4,99187" << std::endl;
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  tree.insert(4, 99187);
+
+  ret = tree.search(1, val);
+  assert(ret && val == 2001);
+
+  ret = tree.search(-1, val);
+  assert(!ret);
+
+  ret = tree.search(5, val);
+  assert(!ret);
+
+  ret = tree.search(4, val);
+  assert(ret && val == 99187);
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "insert 5,88177" << std::endl;
+  tree.insert(5, 88177);
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "level vis" << std::endl;
+  tree.level_visit();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 3,10000" << std::endl;
+  tree.insert(3, 10000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 0,40000" << std::endl;
+  tree.insert(0, 40000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 9,90000" << std::endl;
+  tree.insert(9, 90000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 7,70000" << std::endl;
+  tree.insert(7, 70000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 8,80000" << std::endl;
+  tree.insert(8, 80000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 6,60000" << std::endl;
+  tree.insert(6, 60000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "\n++++++++++++++++++++++++++" << std::endl;
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 11,110000" << std::endl;
+  tree.insert(11, 110000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "tree root key size=" << tree._root->_keys.size()
+            << ", key 0 = " << tree._root->_keys[0]
+            << ", tree height=" << tree._height << std::endl;
   return 0;
 }
