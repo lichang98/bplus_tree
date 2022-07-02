@@ -86,6 +86,12 @@ public:
     return (i == _keys.size() ? -1 : i);
   }
 
+  void leaf_insert(Key &key, Val &val, u32 pos) {
+    assert(_type == NodeType::LEAF);
+    _keys.insert(_keys.begin() + pos, key);
+    _fields.insert(_fields.begin() + pos, val);
+  }
+
   std::shared_ptr<BPlusTNode<Key, Val>>
   get_field_as_ptr(field_type_t<Key, Val> &field) {
     return std::get<std::shared_ptr<BPlusTNode<Key, Val>>>(field);
@@ -96,15 +102,20 @@ public:
   }
 
   // Only for leaf node
-  void move_right_half(std::shared_ptr<BPlusTNode<Key, Val>> other,
-                       u32 beg_pos) {
-    assert(_type == NodeType::LEAF && other->_type == NodeType::LEAF);
+  void move_right_half(std::shared_ptr<BPlusTNode<Key, Val>> other, u32 beg_pos,
+                       bool is_leaf) {
     other->_keys.insert(other->_keys.begin(), _keys.begin() + beg_pos,
                         _keys.end());
-    other->_fields.insert(other->_fields.begin(), _fields.begin() + beg_pos,
-                          _fields.end());
     _keys.erase(_keys.begin() + beg_pos, _keys.end());
-    _fields.erase(_fields.begin() + beg_pos, _fields.end());
+    if (is_leaf) {
+      other->_fields.insert(other->_fields.begin(), _fields.begin() + beg_pos,
+                            _fields.end());
+      _fields.erase(_fields.begin() + beg_pos, _fields.end());
+    } else {
+      other->_fields.insert(other->_fields.begin(),
+                            _fields.begin() + beg_pos + 1, _fields.end());
+      _fields.erase(_fields.begin() + beg_pos + 1, _fields.end());
+    }
   }
 
   // Only for leaf node
@@ -124,6 +135,12 @@ public:
     return _keys[0];
   }
 
+  void remove_min() {
+    assert(_type != NodeType::LEAF);
+    assert(!_keys.empty());
+    _keys.erase(_keys.begin());
+  }
+
   // Insertion for non-leaf node(key and ptr) or leaf node(key and val)
   void insert(Key key, std::shared_ptr<field_type_t<Key, Val>> val,
               std::shared_ptr<field_type_t<Key, Val>> val2 = nullptr) {
@@ -139,7 +156,7 @@ public:
       _keys.insert(_keys.begin() + pos, key);
       _fields.insert(_fields.begin() + pos +
                          ((static_cast<u32>(_type) &
-                           static_cast<u32>(NodeType::MIDDLE)) != 0),
+                           static_cast<u32>(NodeType::LEAF)) == 0),
                      *val);
     }
   }
@@ -158,6 +175,15 @@ public:
     _fields.erase(_fields.begin() + pos);
   }
 
+  // For non-leaf nodes
+  std::shared_ptr<BPlusTNode<Key, Val>> split_right() {
+    std::shared_ptr<BPlusTNode<Key, Val>> right_node =
+        std::make_shared<BPlusTNode<Key, Val>>(_type);
+    right_node->_parent = _parent;
+    move_right_half(right_node, _keys.size() / 2, _type == NodeType::LEAF);
+    return right_node;
+  }
+
   bool touch_low_limit() {
     return _keys.size() < static_cast<u32>(_node_max_cap / 2);
   }
@@ -173,13 +199,13 @@ public:
             << ", Val=" << std::get<Val>(node._fields[i]) << "], ";
       }
       out << "[Key=" << node._keys[i]
-          << ", Val=" << std::get<Val>(node._fields[i]) << "]";
+          << ", Val=" << std::get<Val>(node._fields[i]) << "]  ";
       break;
     default:
       for (; i < node._keys.size() - 1; ++i) {
         out << "[Key=" << node._keys[i] << "], ";
       }
-      out << "[Key=" << node._keys[i] << "]";
+      out << "[Key=" << node._keys[i] << "]  ";
       break;
     }
     return out;
@@ -216,7 +242,8 @@ public:
         auto right = std::make_shared<BPlusTNode<Key, Val>>(NodeType::LEAF);
         auto new_root = std::make_shared<BPlusTNode<Key, Val>>(NodeType::ROOT);
         u32 size = left->_keys.size();
-        left->move_right_half(right, left->_keys.size() / 2);
+        left->move_right_half(right, left->_keys.size() / 2,
+                              left->_type == NodeType::LEAF);
         left->_leaf_right = right;
         _leaf_beg = left;
         left->_parent = new_root;
@@ -230,9 +257,67 @@ public:
       }
       return;
     }
+    assert(_root && _root->_type != NodeType::ROOT_LEAF);
     // When space of target node is enough
+    std::shared_ptr<BPlusTNode<Key, Val>> p = _root;
+    while (p->_type != NodeType::LEAF) {
+      u32 pos = p->find_pos(key);
+      assert(pos >= 0);
+      p = std::get<std::shared_ptr<BPlusTNode<Key, Val>>>(p->_fields[pos]);
+      assert(p);
+    }
+    u32 pos = p->find_pos(key);
+    p->leaf_insert(key, val, pos);
+    if (!p->touch_high_limit())
+      return;
 
     // When target node reaching high limit
+    // Split and copy right min to parent, the parent
+    // may also reaching high limit after that, repeating
+    // (move right min to parent instead of copying) until root
+    // or current parent space enough.
+    std::shared_ptr<BPlusTNode<Key, Val>> right_leaf = p->split_right();
+    right_leaf->_leaf_right = p->_leaf_right;
+    p->_leaf_right = right_leaf;
+    Key right_min = right_leaf->get_min();
+    std::shared_ptr<BPlusTNode<Key, Val>> par = p->_parent.lock();
+    std::shared_ptr<field_type_t<Key, Val>> push_val =
+        std::make_shared<field_type_t<Key, Val>>(right_leaf);
+    par->insert(right_min, push_val);
+    right_leaf->_parent = par;
+    p = par;
+    par = p->_parent.lock();
+    while (p != _root && p->touch_high_limit()) {
+      std::shared_ptr<BPlusTNode<Key, Val>> right_node = p->split_right();
+      Key right_min = right_node->get_min();
+      push_val = std::make_shared<field_type_t<Key, Val>>(right_node);
+      par->insert(right_min, push_val);
+      right_node->remove_min();
+
+      p = par;
+      if (p == _root) {
+        break;
+      }
+      par = p->_parent.lock();
+    }
+
+    // Cascade split reaching root
+    if (p->touch_high_limit() && p == _root) {
+      p->_type = NodeType::MIDDLE;
+      auto right = std::make_shared<BPlusTNode<Key, Val>>(NodeType::MIDDLE);
+      auto new_root = std::make_shared<BPlusTNode<Key, Val>>(NodeType::ROOT);
+      p->move_right_half(right, p->_keys.size() / 2,
+                         p->_type == NodeType::LEAF);
+
+      p->_parent = new_root;
+      right->_parent = new_root;
+      _root = new_root;
+      _root->insert(right->get_min(),
+                    std::make_shared<field_type_t<Key, Val>>(p),
+                    std::make_shared<field_type_t<Key, Val>>(right));
+      right->remove_min();
+      ++_height;
+    }
   }
   void remove(Key key);
   bool search(Key key);
@@ -267,9 +352,6 @@ public:
       if (j == splits.front()) {
         j = 0;
         splits.pop();
-        if (i != 0) {
-          std::cout << " | ";
-        }
       }
       if (i == 0) {
         i = que.size();
@@ -286,18 +368,77 @@ public:
 int main(int argc, char **argv) {
   BPlusTree<u32, u32> tree;
 
+  std::cout << "insert 1,2001" << std::endl;
   tree.insert(1, 2001);
 
+  std::cout << "insert 2,2404" << std::endl;
   tree.insert(2, 2404);
 
+  std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
 
+  std::cout << "insert 4,99187" << std::endl;
   tree.insert(4, 99187);
 
+  std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
 
+  std::cout << "insert 5,88177" << std::endl;
   tree.insert(5, 88177);
+
+  std::cout << "vis leafs" << std::endl;
   tree.visit_leaves();
+
+  std::cout << "level vis" << std::endl;
   tree.level_visit();
+
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 3,10000" << std::endl;
+  tree.insert(3, 10000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 0,40000" << std::endl;
+  tree.insert(0, 40000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 9,90000" << std::endl;
+  tree.insert(9, 90000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 7,70000" << std::endl;
+  tree.insert(7, 70000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 8,80000" << std::endl;
+  tree.insert(8, 80000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 6,60000" << std::endl;
+  tree.insert(6, 60000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
+
+  std::cout << "level vis" << std::endl;
+  std::cout << "insert 11,110000" << std::endl;
+  tree.insert(11, 110000);
+  tree.level_visit();
+  std::cout << "vis leafs" << std::endl;
+  tree.visit_leaves();
   return 0;
 }
