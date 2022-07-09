@@ -1,13 +1,21 @@
 #include "bplustree.hpp"
 #include <iostream>
 
+#include <atomic>
 #include <cassert>
 #include <concepts>
+#include <future>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <queue>
+#include <sstream>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include <gtest/gtest.h>
 
 using u8 = unsigned char;
 using u16 = unsigned short;
@@ -50,7 +58,7 @@ using field_type_t = std::variant<std::shared_ptr<BPlusTNode<Key, Val>>, Val>;
 
 template <typename Key, typename Val>
 requires NodeCpt<Key, Val>
-using root_type_t = std::shared_ptr<BPlusTNode<Key, Val>>;
+using node_type_t = std::shared_ptr<BPlusTNode<Key, Val>>;
 
 enum class NodeType {
   ROOT = 1,
@@ -60,11 +68,151 @@ enum class NodeType {
   ROOT_LEAF = 5
 };
 
+enum class ReqType { QUERY = 0, INSERT, DELETE };
+
 constexpr u16 _node_max_cap = 3;
 
 constexpr bool too_few(u32 n) { return n < (_node_max_cap / 2); }
 
 constexpr bool too_much(u32 n) { return n > (_node_max_cap); }
+
+constexpr u32 req_msg_max_len = 512;
+template <typename Key, typename Val>
+requires NodeCpt<Key, Val>
+class Request {
+public:
+  Request(ReqType req_type, Key key) : _req_type(req_type), _key(key) {}
+  Request(ReqType req_type, Key key, Val val)
+      : _req_type(req_type), _key(key), _val(val) {}
+  ReqType _req_type;
+  Key _key;
+  Val _val;
+
+  std::ostringstream _msg;
+};
+
+template <typename Key, typename Val>
+requires NodeCpt<Key, Val>
+class TLock {
+public:
+  TLock() {}
+  TLock(const TLock &other) = delete;
+  TLock &operator=(const TLock &other) = delete;
+  TLock(const TLock &&other) = delete;
+
+  void query(std::shared_ptr<Request<Key, Val>> req) {
+    {
+      const std::lock_guard<std::mutex> lk(_mut_read_que);
+      _read_que.emplace_back(req);
+    }
+
+    if (!_mut_read_tas.try_lock()) {
+      return;
+    }
+
+    while (_tas.test_and_set())
+      ;
+
+    {
+      const std::lock_guard<std::mutex> lk(_mut_read_que);
+      _read_sec_que.insert(_read_sec_que.begin(), _read_que.begin(),
+                           _read_que.end());
+      _read_que.clear();
+    }
+    // Processing sec que
+    for (auto q : _read_sec_que) {
+      switch (q->_req_type) {
+      case ReqType::QUERY:
+        if (!_tree.search(q->_key, q->_val)) {
+          q->_msg << "FAIL: Key " << q->_key << " not found!";
+        } else {
+          q->_msg << "SUCC: Key " << q->_key << " found.";
+        }
+
+        break;
+      default:
+        q->_msg << "FAIL: Invalid request!";
+        break;
+      }
+    }
+
+    _read_sec_que.clear();
+    _mut_read_tas.unlock();
+    _tas.clear();
+  }
+
+  void modify(std::shared_ptr<Request<Key, Val>> req) {
+    {
+      const std::lock_guard<std::mutex> lk(_mut_write_que);
+      _write_que.emplace_back(req);
+    }
+
+    if (!_mut_write_tas.try_lock()) {
+      return;
+    }
+
+    while (_tas.test_and_set())
+      ;
+
+    {
+      const std::lock_guard<std::mutex> lk(_mut_write_que);
+      _write_sec_que.insert(_write_sec_que.begin(), _write_que.begin(),
+                            _write_que.end());
+      _write_que.clear();
+    }
+    // Processing sec que
+    for (auto q : _write_sec_que) {
+      switch (q->_req_type) {
+      case ReqType::INSERT:
+        _tree.insert(q->_key, q->_val);
+        q->_msg << "SUCC: Insertion finish.";
+        break;
+      case ReqType::DELETE:
+        _tree.remove(q->_key);
+        q->_msg << "SUCC: Deletion finish.";
+        break;
+      default:
+        q->_msg << "FAIL: Request type invalid!";
+        break;
+      }
+    }
+    _write_sec_que.clear();
+    _mut_write_tas.unlock();
+    _tas.clear();
+  }
+
+  std::future<void> solve(std::shared_ptr<Request<Key, Val>> req) {
+    switch (req->_req_type) {
+    case ReqType::QUERY:
+      return std::async(std::launch::async | std::launch::deferred,
+                        &TLock::query, this, req);
+      break;
+    case ReqType::INSERT:
+    case ReqType::DELETE:
+      return std::async(std::launch::async | std::launch::deferred,
+                        &TLock::modify, this, req);
+      break;
+    default:
+      req->_msg << "FAIL: Invalid request!";
+      return std::future<void>();
+    }
+  }
+
+  std::vector<std::shared_ptr<Request<Key, Val>>> _read_que;
+  std::vector<std::shared_ptr<Request<Key, Val>>> _read_sec_que;
+  std::vector<std::shared_ptr<Request<Key, Val>>> _write_que;
+  std::vector<std::shared_ptr<Request<Key, Val>>> _write_sec_que;
+
+  std::mutex _mut_read_que;
+  std::mutex _mut_write_que;
+
+  std::mutex _mut_read_tas;
+  std::mutex _mut_write_tas;
+
+  std::atomic_flag _tas = ATOMIC_FLAG_INIT;
+
+  BPlusTree<Key, Val> _tree;
+};
 
 template <typename Key, typename Val>
 requires NodeCpt<Key, Val>
@@ -108,9 +256,8 @@ public:
     _fields.insert(_fields.begin() + pos, val);
   }
 
-  std::shared_ptr<BPlusTNode<Key, Val>>
-  get_field_as_ptr(field_type_t<Key, Val> &field) {
-    return std::get<std::shared_ptr<BPlusTNode<Key, Val>>>(field);
+  node_type_t<Key, Val> get_field_as_ptr(field_type_t<Key, Val> &field) {
+    return std::get<node_type_t<Key, Val>>(field);
   }
 
   Val get_field_as_val(field_type_t<Key, Val> &field) {
@@ -118,8 +265,7 @@ public:
   }
 
   // Only for leaf node
-  void move_right_half(std::shared_ptr<BPlusTNode<Key, Val>> other, u32 beg_pos,
-                       bool is_leaf) {
+  void move_right_half(node_type_t<Key, Val> other, u32 beg_pos, bool is_leaf) {
     other->_keys.insert(other->_keys.begin(), _keys.begin() + beg_pos,
                         _keys.end());
     _keys.erase(_keys.begin() + beg_pos, _keys.end());
@@ -131,15 +277,14 @@ public:
       other->_fields.insert(other->_fields.begin(),
                             _fields.begin() + beg_pos + 1, _fields.end());
       for (u32 pos = 0; pos < other->_fields.size(); ++pos) {
-        std::get<root_type_t<Key, Val>>(other->_fields[pos])->_parent = other;
+        std::get<node_type_t<Key, Val>>(other->_fields[pos])->_parent = other;
       }
       _fields.erase(_fields.begin() + beg_pos + 1, _fields.end());
     }
   }
 
   // Only for leaf node
-  void move_left_half(std::shared_ptr<BPlusTNode<Key, Val>> other,
-                      u32 end_pos) {
+  void move_left_half(node_type_t<Key, Val> other, u32 end_pos) {
     other->_keys.insert(other->_keys.end(), _keys.begin(),
                         _keys.begin() + end_pos);
     _keys.erase(_keys.begin(), _keys.begin() + end_pos);
@@ -151,7 +296,7 @@ public:
       other->_fields.insert(other->_fields.end(), _fields.begin(),
                             _fields.begin() + end_pos + 1);
       for (u32 pos = 0; pos < other->_fields.size(); ++pos) {
-        std::get<root_type_t<Key, Val>>(other->_fields[pos])->_parent = other;
+        std::get<node_type_t<Key, Val>>(other->_fields[pos])->_parent = other;
       }
       _fields.erase(_fields.begin(), _fields.begin() + end_pos + 1);
     }
@@ -223,42 +368,42 @@ public:
   }
 
   // For non-leaf nodes
-  std::shared_ptr<BPlusTNode<Key, Val>> split_right() {
-    std::shared_ptr<BPlusTNode<Key, Val>> right_node =
+  node_type_t<Key, Val> split_right() {
+    node_type_t<Key, Val> right_node =
         std::make_shared<BPlusTNode<Key, Val>>(_type);
     right_node->_parent = _parent;
     move_right_half(right_node, _keys.size() / 2, _type == NodeType::LEAF);
     return right_node;
   }
 
-  std::shared_ptr<BPlusTNode<Key, Val>> get_right_sib() {
+  node_type_t<Key, Val> get_right_sib() {
     assert(!(static_cast<u32>(_type) & static_cast<u32>(NodeType::ROOT)));
     u32 pos = 0;
     auto par = _parent.lock();
     while (pos < par->_fields.size() &&
-           std::get<root_type_t<Key, Val>>(par->_fields[pos])->get_min() !=
+           std::get<node_type_t<Key, Val>>(par->_fields[pos])->get_min() !=
                get_min())
       ++pos;
     assert(pos < par->_fields.size());
     if (pos == par->_fields.size() - 1)
       return nullptr;
     else
-      return std::get<root_type_t<Key, Val>>(par->_fields[pos + 1]);
+      return std::get<node_type_t<Key, Val>>(par->_fields[pos + 1]);
   }
 
-  std::shared_ptr<BPlusTNode<Key, Val>> get_left_sib() {
+  node_type_t<Key, Val> get_left_sib() {
     assert(!(static_cast<u32>(_type) & static_cast<u32>(NodeType::ROOT)));
     u32 pos = 0;
     auto par = _parent.lock();
     while (pos < par->_fields.size() &&
-           std::get<root_type_t<Key, Val>>(par->_fields[pos])->get_min() !=
+           std::get<node_type_t<Key, Val>>(par->_fields[pos])->get_min() !=
                get_min())
       ++pos;
     assert(pos < par->_fields.size());
     if (pos == 0)
       return nullptr;
     else
-      return std::get<root_type_t<Key, Val>>(par->_fields[pos - 1]);
+      return std::get<node_type_t<Key, Val>>(par->_fields[pos - 1]);
   }
 
   bool touch_low_limit() {
@@ -273,27 +418,29 @@ public:
     case NodeType::LEAF:
       for (; i < node._keys.size() - 1; ++i) {
         out << "[Key=" << node._keys[i]
-            << ", Val=" << std::get<Val>(node._fields[i]) << "], ";
+            << ", Val=" << std::get<Val>(node._fields[i]) << "]";
         if (node._parent.lock()) {
-          out << ",,,parent key0=" << node._parent.lock()->_keys[0] << "  ";
+          out << "(isleaf, parent key0=" << node._parent.lock()->_keys[0]
+              << "), ";
         }
       }
       out << "[Key=" << node._keys[i]
-          << ", Val=" << std::get<Val>(node._fields[i]) << "]  ";
+          << ", Val=" << std::get<Val>(node._fields[i]) << "]";
       if (node._parent.lock()) {
-        out << ",,,parent key0=" << node._parent.lock()->_keys[0] << "  ";
+        out << "(isleaf, parent key0=" << node._parent.lock()->_keys[0]
+            << ")  ";
       }
       break;
     default:
       for (; i < node._keys.size() - 1; ++i) {
-        out << "[Key=" << node._keys[i] << "], ";
+        out << "[Key=" << node._keys[i] << "]";
         if (node._parent.lock()) {
-          out << ",,,parent key0=" << node._parent.lock()->_keys[0] << "  ";
+          out << "(parent key0=" << node._parent.lock()->_keys[0] << ")  ";
         }
       }
-      out << "[Key=" << node._keys[i] << "]  ";
+      out << "[Key=" << node._keys[i] << "]";
       if (node._parent.lock()) {
-        out << ",,,parent key0=" << node._parent.lock()->_keys[0] << "  ";
+        out << "(parent key0=" << node._parent.lock()->_keys[0] << ")  ";
       }
       break;
     }
@@ -351,11 +498,11 @@ public:
     }
     assert(_root && _root->_type != NodeType::ROOT_LEAF);
     // When space of target node is enough
-    std::shared_ptr<BPlusTNode<Key, Val>> p = _root;
+    auto p = _root;
     while (p->_type != NodeType::LEAF) {
       u32 pos = p->find_pos(key);
       assert(pos >= 0);
-      p = std::get<std::shared_ptr<BPlusTNode<Key, Val>>>(p->_fields[pos]);
+      p = std::get<node_type_t<Key, Val>>(p->_fields[pos]);
       assert(p);
     }
     u32 pos = p->find_pos(key);
@@ -368,22 +515,21 @@ public:
     // may also reaching high limit after that, repeating
     // (move right min to parent instead of copying) until root
     // or current parent space enough.
-    std::shared_ptr<BPlusTNode<Key, Val>> right_leaf = p->split_right();
+    auto right_leaf = p->split_right();
     right_leaf->_leaf_right = p->_leaf_right;
     p->_leaf_right = right_leaf;
     right_leaf->_leaf_left = p;
     if (right_leaf->_leaf_right)
       right_leaf->_leaf_right->_leaf_left = right_leaf;
     Key right_min = right_leaf->get_min();
-    std::shared_ptr<BPlusTNode<Key, Val>> par = p->_parent.lock();
-    std::shared_ptr<field_type_t<Key, Val>> push_val =
-        std::make_shared<field_type_t<Key, Val>>(right_leaf);
+    auto par = p->_parent.lock();
+    auto push_val = std::make_shared<field_type_t<Key, Val>>(right_leaf);
     par->insert(right_min, push_val);
     right_leaf->_parent = par;
     p = par;
     par = p->_parent.lock();
     while (p != _root && p->touch_high_limit()) {
-      std::shared_ptr<BPlusTNode<Key, Val>> right_node = p->split_right();
+      auto right_node = p->split_right();
       Key right_min = right_node->get_min();
       push_val = std::make_shared<field_type_t<Key, Val>>(right_node);
       par->insert(right_min, push_val);
@@ -418,7 +564,7 @@ public:
   void remove(Key key) {
     Val val;
     u32 pos;
-    std::shared_ptr<BPlusTNode<Key, Val>> p = search(key, val);
+    auto p = search(key, val);
     if (!p)
       return;
 
@@ -541,13 +687,25 @@ public:
     }
   }
 
-  root_type_t<Key, Val> search(Key key, Val &ret_val) {
-    std::shared_ptr<BPlusTNode<Key, Val>> p = _root;
+  node_type_t<Key, Val> search(Key key, Val &ret_val) {
+    auto p = _root;
     while (p &&
            !(static_cast<u32>(p->_type) & static_cast<u32>(NodeType::LEAF))) {
       u32 pos = p->find_pos(key);
+      std::cout << "debug, pos=" << pos << ", key=" << key
+                << ", p type=" << static_cast<u32>(p->_type) << std::endl;
+      for (auto tmp : p->_keys) {
+
+        std::cout << " key=" << tmp << " ";
+      }
+      std::cout << std::endl;
+      if (pos == 3 && key == 10) {
+        std::cout << "debug, pos=" << pos << ", key=" << key
+                  << ", fields size=" << p->_fields.size() << std::endl;
+        level_visit();
+      }
       assert(pos < p->_fields.size());
-      p = std::get<root_type_t<Key, Val>>(p->_fields[pos]);
+      p = std::get<node_type_t<Key, Val>>(p->_fields[pos]);
     }
     assert(p);
     u32 pos = p->find_pos_exact(key);
@@ -558,7 +716,7 @@ public:
   }
 
   void visit_leaves() {
-    std::shared_ptr<BPlusTNode<Key, Val>> p = _leaf_beg;
+    auto p = _leaf_beg;
     if (!p) {
       std::cout << " --- " << std::endl;
     }
@@ -574,7 +732,7 @@ public:
       std::cout << "[ ]" << std::endl;
       return;
     }
-    std::queue<std::shared_ptr<BPlusTNode<Key, Val>>> que;
+    std::queue<node_type_t<Key, Val>> que;
     que.push(_root);
     u32 i = 1;
     std::queue<u32> splits;
@@ -585,7 +743,7 @@ public:
             static_cast<u32>(NodeType::LEAF))) {
         splits.push(que.front()->_fields.size());
         for (auto child : que.front()->_fields) {
-          que.push(std::get<std::shared_ptr<BPlusTNode<Key, Val>>>(child));
+          que.push(std::get<node_type_t<Key, Val>>(child));
         }
       }
       std::cout << *(que.front());
@@ -603,12 +761,12 @@ public:
     }
   }
 
-  root_type_t<Key, Val> _root;
-  std::shared_ptr<BPlusTNode<Key, Val>> _leaf_beg;
+  node_type_t<Key, Val> _root;
+  node_type_t<Key, Val> _leaf_beg;
   u32 _height;
 };
 
-int main(int argc, char **argv) {
+TEST(BPlusTreeTest, NormalTest) {
   BPlusTree<u32, u32> tree;
 
   u32 val;
@@ -918,5 +1076,54 @@ int main(int argc, char **argv) {
   std::cout << "tree root key size=" << tree._root->_keys.size()
             << ", key 0 = " << tree._root->_keys[0]
             << ", tree height=" << tree._height << std::endl;
-  return 0;
+}
+
+TEST(BPlusTreeTest, ParallelTest) {
+  TLock<u32, u32> tl;
+  std::shared_ptr<Request<u32, u32>> req =
+      std::make_shared<Request<u32, u32>>(ReqType::QUERY, 3);
+  std::future<void> fut = tl.solve(req);
+  std::shared_ptr<Request<u32, u32>> req2 =
+      std::make_shared<Request<u32, u32>>(ReqType::INSERT, 3, 10);
+  std::future<void> fut2 = tl.solve(req2);
+  std::shared_ptr<Request<u32, u32>> req3 =
+      std::make_shared<Request<u32, u32>>(ReqType::QUERY, 3);
+  std::future<void> fut3 = tl.solve(req3);
+  fut.wait();
+  std::cout << "fut1 wait finish, msg=" << req->_msg.str()
+            << ", val=" << req->_val << std::endl;
+  fut2.wait();
+  std::cout << "fut2 wait finish, msg=" << req2->_msg.str() << std::endl;
+  fut3.wait();
+  std::cout << "fut2 wait finish, msg=" << req3->_msg.str()
+            << ", val=" << req3->_val << std::endl;
+}
+
+TEST(BPlusTreeTest, NormalBigTest) {
+  BPlusTree<u32, u32> tree;
+  for (u32 i = 0; i < 11; ++i) {
+    tree.insert(i, i);
+  }
+  u32 val;
+  for (u32 i = 0; i < 11; ++i) {
+    EXPECT_NE(tree.search(i, val), nullptr);
+    EXPECT_EQ(val, i);
+  }
+  tree.level_visit();
+  for (u32 i = 0; i < 11; ++i) {
+    tree.remove(i);
+    std::cout << "after removing " << i << std::endl;
+    tree.level_visit();
+    EXPECT_EQ(tree.search(i, val), nullptr);
+  }
+  for (u32 i = 0; i < 11; ++i) {
+    EXPECT_EQ(tree.search(i, val), nullptr);
+  }
+}
+
+TEST(BPlusTreeTest, ParallelBigTest) {}
+
+int main(int argc, char **argv) {
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
 }
