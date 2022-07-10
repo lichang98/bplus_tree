@@ -1,14 +1,18 @@
 #include "bplustree.hpp"
 #include <iostream>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <concepts>
+#include <cstring>
+#include <ctime>
 #include <future>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <random>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -68,6 +72,8 @@ enum class NodeType {
   ROOT_LEAF = 5
 };
 
+enum class Redist { NONE = 0, LEFT, RIGHT };
+
 enum class ReqType { QUERY = 0, INSERT, DELETE };
 
 constexpr u16 _node_max_cap = 3;
@@ -95,90 +101,58 @@ template <typename Key, typename Val>
 requires NodeCpt<Key, Val>
 class TLock {
 public:
-  TLock() {}
+  TLock() { _read_count = 0; }
   TLock(const TLock &other) = delete;
   TLock &operator=(const TLock &other) = delete;
   TLock(const TLock &&other) = delete;
 
   void query(std::shared_ptr<Request<Key, Val>> req) {
     {
-      const std::lock_guard<std::mutex> lk(_mut_read_que);
-      _read_que.emplace_back(req);
+      const std::lock_guard<std::mutex> lk(_mut_r);
+      if (_read_count == 0) {
+        _mut_w.lock();
+      }
+      ++_read_count;
     }
 
-    if (!_mut_read_tas.try_lock()) {
-      return;
-    }
+    switch (req->_req_type) {
+    case ReqType::QUERY:
+      if (!_tree.search(req->_key, req->_val)) {
+        req->_msg << "FAIL: Key " << req->_key << " not found!";
+      } else {
+        req->_msg << "SUCC: Key " << req->_key << " found.";
+      }
 
-    while (_tas.test_and_set())
-      ;
+      break;
+    default:
+      req->_msg << "FAIL: Invalid request!";
+      break;
+    }
 
     {
-      const std::lock_guard<std::mutex> lk(_mut_read_que);
-      _read_sec_que.insert(_read_sec_que.begin(), _read_que.begin(),
-                           _read_que.end());
-      _read_que.clear();
-    }
-    // Processing sec que
-    for (auto q : _read_sec_que) {
-      switch (q->_req_type) {
-      case ReqType::QUERY:
-        if (!_tree.search(q->_key, q->_val)) {
-          q->_msg << "FAIL: Key " << q->_key << " not found!";
-        } else {
-          q->_msg << "SUCC: Key " << q->_key << " found.";
-        }
-
-        break;
-      default:
-        q->_msg << "FAIL: Invalid request!";
-        break;
+      const std::lock_guard<std::mutex> lk(_mut_r);
+      if (--_read_count == 0) {
+        _mut_w.unlock();
       }
     }
-
-    _read_sec_que.clear();
-    _mut_read_tas.unlock();
-    _tas.clear();
   }
 
   void modify(std::shared_ptr<Request<Key, Val>> req) {
-    {
-      const std::lock_guard<std::mutex> lk(_mut_write_que);
-      _write_que.emplace_back(req);
-    }
+    const std::lock_guard<std::mutex> lk(_mut_w);
 
-    if (!_mut_write_tas.try_lock()) {
-      return;
+    switch (req->_req_type) {
+    case ReqType::INSERT:
+      _tree.insert(req->_key, req->_val);
+      req->_msg << "SUCC: Insertion finish.";
+      break;
+    case ReqType::DELETE:
+      _tree.remove(req->_key);
+      req->_msg << "SUCC: Deletion finish.";
+      break;
+    default:
+      req->_msg << "FAIL: Request type invalid!";
+      break;
     }
-
-    while (_tas.test_and_set())
-      ;
-
-    {
-      const std::lock_guard<std::mutex> lk(_mut_write_que);
-      _write_sec_que.insert(_write_sec_que.begin(), _write_que.begin(),
-                            _write_que.end());
-      _write_que.clear();
-    }
-    // Processing sec que
-    for (auto q : _write_sec_que) {
-      switch (q->_req_type) {
-      case ReqType::INSERT:
-        _tree.insert(q->_key, q->_val);
-        q->_msg << "SUCC: Insertion finish.";
-        break;
-      case ReqType::DELETE:
-        _tree.remove(q->_key);
-        q->_msg << "SUCC: Deletion finish.";
-        break;
-      default:
-        q->_msg << "FAIL: Request type invalid!";
-        break;
-      }
-    }
-    _write_sec_que.clear();
-    _mut_write_tas.unlock();
-    _tas.clear();
   }
 
   std::future<void> solve(std::shared_ptr<Request<Key, Val>> req) {
@@ -198,19 +172,9 @@ public:
     }
   }
 
-  std::vector<std::shared_ptr<Request<Key, Val>>> _read_que;
-  std::vector<std::shared_ptr<Request<Key, Val>>> _read_sec_que;
-  std::vector<std::shared_ptr<Request<Key, Val>>> _write_que;
-  std::vector<std::shared_ptr<Request<Key, Val>>> _write_sec_que;
-
-  std::mutex _mut_read_que;
-  std::mutex _mut_write_que;
-
-  std::mutex _mut_read_tas;
-  std::mutex _mut_write_tas;
-
-  std::atomic_flag _tas = ATOMIC_FLAG_INIT;
-
+  i32 _read_count;
+  std::mutex _mut_r;
+  std::mutex _mut_w;
   BPlusTree<Key, Val> _tree;
 };
 
@@ -221,7 +185,7 @@ public:
   BPlusTNode(NodeType type) { _type = type; }
 
   u32 find_pos(Key &key) {
-    u32 i = 0;
+    i32 i = 0;
     for (; i < _keys.size(); ++i) {
       if (key < _keys[i]) {
         break;
@@ -231,8 +195,8 @@ public:
   }
 
   u32 find_pos_low(Key &key) {
-    u32 i = _keys.size() - 1;
-    for (; i < _keys.size(); --i) {
+    i32 i = _keys.size() - 1;
+    for (; i > 0; --i) {
       if (key >= _keys[i]) {
         break;
       }
@@ -241,7 +205,7 @@ public:
   }
 
   u32 find_pos_exact(Key &key) {
-    u32 i = 0;
+    i32 i = 0;
     for (; i < _keys.size(); ++i) {
       if (key == _keys[i]) {
         break;
@@ -276,7 +240,7 @@ public:
     } else {
       other->_fields.insert(other->_fields.begin(),
                             _fields.begin() + beg_pos + 1, _fields.end());
-      for (u32 pos = 0; pos < other->_fields.size(); ++pos) {
+      for (i32 pos = 0; pos < other->_fields.size(); ++pos) {
         std::get<node_type_t<Key, Val>>(other->_fields[pos])->_parent = other;
       }
       _fields.erase(_fields.begin() + beg_pos + 1, _fields.end());
@@ -295,7 +259,7 @@ public:
     } else {
       other->_fields.insert(other->_fields.end(), _fields.begin(),
                             _fields.begin() + end_pos + 1);
-      for (u32 pos = 0; pos < other->_fields.size(); ++pos) {
+      for (i32 pos = 0; pos < other->_fields.size(); ++pos) {
         std::get<node_type_t<Key, Val>>(other->_fields[pos])->_parent = other;
       }
       _fields.erase(_fields.begin(), _fields.begin() + end_pos + 1);
@@ -335,13 +299,27 @@ public:
     }
   }
 
-  void update_split_key(Key old_key, Key new_key) {
+  void update_split_key(node_type_t<Key, Val> new_key, Redist redist) {
     assert(_type != NodeType::LEAF);
-    for (Key &k : _keys) {
-      if (k <= old_key) {
-        k = new_key;
-        break;
+    switch (redist) {
+    case Redist::LEFT:
+      for (i32 i = 0; i < _keys.size(); ++i) {
+        if (new_key->get_min() >= _keys[i]) {
+          _keys[i] = new_key->get_min();
+          break;
+        }
       }
+      break;
+    case Redist::RIGHT:
+      for (i32 i = _keys.size() - 1; i >= 0; --i) {
+        if (new_key->get_min() <= _keys[i]) {
+          _keys[i] = new_key->get_min();
+          break;
+        }
+      }
+      break;
+    default:
+      break;
     }
   }
 
@@ -412,10 +390,12 @@ public:
   bool touch_high_limit() { return _keys.size() > _node_max_cap; }
 
   friend std::ostream &operator<<(std::ostream &out, const BPlusTNode &node) {
-    u32 i = 0;
+    i32 i = 0;
     switch (node._type) {
     case NodeType::ROOT_LEAF:
     case NodeType::LEAF:
+      if (node._keys.empty())
+        break;
       for (; i < node._keys.size() - 1; ++i) {
         out << "[Key=" << node._keys[i]
             << ", Val=" << std::get<Val>(node._fields[i]) << "]";
@@ -432,6 +412,8 @@ public:
       }
       break;
     default:
+      if (node._keys.empty())
+        break;
       for (; i < node._keys.size() - 1; ++i) {
         out << "[Key=" << node._keys[i] << "]";
         if (node._parent.lock()) {
@@ -562,6 +544,10 @@ public:
   }
 
   void remove(Key key) {
+
+    std::cout << "debug before remove key=" << key << std::endl;
+    level_visit();
+
     Val val;
     u32 pos;
     auto p = search(key, val);
@@ -605,7 +591,7 @@ public:
             p->_keys.emplace_back(parent->_keys[pos]);
           }
           sib->move_left_half(p, mv_size);
-          parent->update_split_key(right_min, sib->get_min());
+          parent->update_split_key(sib, Redist::LEFT);
           if (sib->_type != NodeType::LEAF) {
             sib->_keys.erase(sib->_keys.begin());
           }
@@ -616,7 +602,7 @@ public:
             sib->_keys.emplace_back(parent->_keys[pos]);
           }
           sib->move_right_half(p, total_size / 2, p->_type == NodeType::LEAF);
-          parent->update_split_key(right_min, p->get_min());
+          parent->update_split_key(p, Redist::RIGHT);
           if (p->_type != NodeType::LEAF) {
             p->_keys.erase(p->_keys.begin());
           }
@@ -626,14 +612,24 @@ public:
         // the removing may cascade
         if (is_right) {
           pos = parent->find_pos_low(right_min);
+
+          if (pos < parent->_keys.size()) {
+            std::cout << "debug pos=" << pos
+                      << ", keys size=" << parent->_keys.size()
+                      << ", key=" << key << std::endl;
+            level_visit();
+          }
+
           assert(pos < parent->_keys.size());
           if (p->_type != NodeType::LEAF) {
             p->_keys.emplace_back(parent->_keys[pos]);
           }
           parent->remove_key_by_pos(pos);
-          parent->remove_fld_by_pos(pos);
+          if (parent->_fields.size() > 2) {
+            parent->remove_fld_by_pos(pos + 1);
+          }
           p->move_right_half(sib, 0, p->_type == NodeType::LEAF);
-          parent->update_split_key(right_min, sib->get_min());
+          parent->update_split_key(sib, Redist::NONE);
           if (p == _leaf_beg) {
             _leaf_beg = sib;
           } else {
@@ -649,9 +645,11 @@ public:
             sib->_keys.emplace_back(parent->_keys[pos]);
           }
           parent->remove_key_by_pos(pos);
-          parent->remove_fld_by_pos(pos + 1);
+          if (parent->_fields.size() > 2) {
+            parent->remove_fld_by_pos(pos + 1);
+          }
           p->move_left_half(sib, p->_keys.size());
-          parent->update_split_key(right_min, sib->get_min());
+          parent->update_split_key(sib, Redist::NONE);
 
           sib->_leaf_right = p->_leaf_right;
           if (p->_leaf_right) {
@@ -692,18 +690,6 @@ public:
     while (p &&
            !(static_cast<u32>(p->_type) & static_cast<u32>(NodeType::LEAF))) {
       u32 pos = p->find_pos(key);
-      std::cout << "debug, pos=" << pos << ", key=" << key
-                << ", p type=" << static_cast<u32>(p->_type) << std::endl;
-      for (auto tmp : p->_keys) {
-
-        std::cout << " key=" << tmp << " ";
-      }
-      std::cout << std::endl;
-      if (pos == 3 && key == 10) {
-        std::cout << "debug, pos=" << pos << ", key=" << key
-                  << ", fields size=" << p->_fields.size() << std::endl;
-        level_visit();
-      }
       assert(pos < p->_fields.size());
       p = std::get<node_type_t<Key, Val>>(p->_fields[pos]);
     }
@@ -766,7 +752,7 @@ public:
   u32 _height;
 };
 
-TEST(BPlusTreeTest, NormalTest) {
+TEST(BPlusTreeTest, DISABLED_NormalTest) {
   BPlusTree<u32, u32> tree;
 
   u32 val;
@@ -1078,7 +1064,7 @@ TEST(BPlusTreeTest, NormalTest) {
             << ", tree height=" << tree._height << std::endl;
 }
 
-TEST(BPlusTreeTest, ParallelTest) {
+TEST(BPlusTreeTest, DISABLED_ParallelTest) {
   TLock<u32, u32> tl;
   std::shared_ptr<Request<u32, u32>> req =
       std::make_shared<Request<u32, u32>>(ReqType::QUERY, 3);
@@ -1099,29 +1085,55 @@ TEST(BPlusTreeTest, ParallelTest) {
             << ", val=" << req3->_val << std::endl;
 }
 
-TEST(BPlusTreeTest, NormalBigTest) {
+TEST(BPlusTreeTest, DISABLED_NormalBigTest) {
   BPlusTree<u32, u32> tree;
-  for (u32 i = 0; i < 11; ++i) {
+  for (u32 i = 0; i < 100000; ++i) {
     tree.insert(i, i);
   }
+
   u32 val;
-  for (u32 i = 0; i < 11; ++i) {
+  for (u32 i = 0; i < 100000; ++i) {
     EXPECT_NE(tree.search(i, val), nullptr);
     EXPECT_EQ(val, i);
   }
-  tree.level_visit();
-  for (u32 i = 0; i < 11; ++i) {
+
+  for (u32 i = 0; i < 100000; ++i) {
     tree.remove(i);
-    std::cout << "after removing " << i << std::endl;
-    tree.level_visit();
     EXPECT_EQ(tree.search(i, val), nullptr);
   }
-  for (u32 i = 0; i < 11; ++i) {
+  for (u32 i = 0; i < 100000; ++i) {
     EXPECT_EQ(tree.search(i, val), nullptr);
   }
 }
 
-TEST(BPlusTreeTest, ParallelBigTest) {}
+TEST(BPlusTreeTest, NormalRandomTest) {
+  auto rng = std::default_random_engine(time(0));
+  std::vector<u32> vals(10);
+  for (u32 i = 0; i < 10; ++i) {
+    vals[i] = i;
+  }
+  std::shuffle(vals.begin(), vals.end(), rng);
+
+  BPlusTree<u32, u32> tree;
+  for (auto &i : vals) {
+    tree.insert(i, i);
+  }
+
+  u32 val;
+  for (auto &i : vals) {
+    EXPECT_NE(tree.search(i, val), nullptr);
+    EXPECT_EQ(val, i);
+  }
+
+  for (auto &i : vals) {
+    tree.remove(i);
+    EXPECT_EQ(tree.search(i, val), nullptr);
+  }
+
+  for (auto &i : vals) {
+    EXPECT_EQ(tree.search(i, val), nullptr);
+  }
+}
 
 int main(int argc, char **argv) {
   testing::InitGoogleTest(&argc, argv);
