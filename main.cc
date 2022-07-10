@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <map>
 
 using u8 = unsigned char;
 using u16 = unsigned short;
@@ -233,9 +234,14 @@ public:
     other->_keys.insert(other->_keys.begin(), _keys.begin() + beg_pos,
                         _keys.end());
     _keys.erase(_keys.begin() + beg_pos, _keys.end());
-    if (is_leaf) {
+    if (is_leaf || _fields.size() < 2) {
       other->_fields.insert(other->_fields.begin(), _fields.begin() + beg_pos,
                             _fields.end());
+      if (!is_leaf) {
+        for (i32 pos = 0; pos < other->_fields.size(); ++pos) {
+          std::get<node_type_t<Key, Val>>(other->_fields[pos])->_parent = other;
+        }
+      }
       _fields.erase(_fields.begin() + beg_pos, _fields.end());
     } else {
       other->_fields.insert(other->_fields.begin(),
@@ -252,9 +258,15 @@ public:
     other->_keys.insert(other->_keys.end(), _keys.begin(),
                         _keys.begin() + end_pos);
     _keys.erase(_keys.begin(), _keys.begin() + end_pos);
-    if (static_cast<u32>(_type) & static_cast<u32>(NodeType::LEAF)) {
+    bool is_leaf = static_cast<u32>(_type) & static_cast<u32>(NodeType::LEAF);
+    if (is_leaf || _fields.size() < 2) {
       other->_fields.insert(other->_fields.end(), _fields.begin(),
                             _fields.begin() + end_pos);
+      if (!is_leaf) {
+        for (i32 pos = 0; pos < other->_fields.size(); ++pos) {
+          std::get<node_type_t<Key, Val>>(other->_fields[pos])->_parent = other;
+        }
+      }
       _fields.erase(_fields.begin(), _fields.begin() + end_pos);
     } else {
       other->_fields.insert(other->_fields.end(), _fields.begin(),
@@ -304,7 +316,7 @@ public:
     switch (redist) {
     case Redist::LEFT:
       for (i32 i = 0; i < _keys.size(); ++i) {
-        if (new_key->get_min() >= _keys[i]) {
+        if (new_key->get_min() <= _keys[i]) {
           _keys[i] = new_key->get_min();
           break;
         }
@@ -312,7 +324,7 @@ public:
       break;
     case Redist::RIGHT:
       for (i32 i = _keys.size() - 1; i >= 0; --i) {
-        if (new_key->get_min() <= _keys[i]) {
+        if (new_key->get_min() >= _keys[i]) {
           _keys[i] = new_key->get_min();
           break;
         }
@@ -327,6 +339,8 @@ public:
     u32 pos = find_pos_exact(key);
     if (pos > _keys.size())
       return false;
+    if (_keys.size() == 1)
+      _min_key = _keys[0];
     _keys.erase(_keys.begin() + pos);
     *pos_rm = pos;
     return true;
@@ -450,6 +464,16 @@ public:
   }
 
   void insert(Key key, Val val) {
+    Val tmp_val;
+    auto tmp_p = search(key, tmp_val);
+    if (tmp_p) {
+      // If exists, update with new val
+      assert(static_cast<u32>(tmp_p->_type) & static_cast<u32>(NodeType::LEAF));
+      u32 tmp_pos = tmp_p->find_pos_exact(key);
+      tmp_p->_fields[tmp_pos] = val;
+      return;
+    }
+
     // When only root node
     if (_height == 0) {
       std::shared_ptr<field_type_t<Key, Val>> val_entry(
@@ -544,10 +568,6 @@ public:
   }
 
   void remove(Key key) {
-
-    std::cout << "debug before remove key=" << key << std::endl;
-    level_visit();
-
     Val val;
     u32 pos;
     auto p = search(key, val);
@@ -591,7 +611,7 @@ public:
             p->_keys.emplace_back(parent->_keys[pos]);
           }
           sib->move_left_half(p, mv_size);
-          parent->update_split_key(sib, Redist::LEFT);
+          parent->update_split_key(sib, Redist::RIGHT);
           if (sib->_type != NodeType::LEAF) {
             sib->_keys.erase(sib->_keys.begin());
           }
@@ -602,7 +622,7 @@ public:
             sib->_keys.emplace_back(parent->_keys[pos]);
           }
           sib->move_right_half(p, total_size / 2, p->_type == NodeType::LEAF);
-          parent->update_split_key(p, Redist::RIGHT);
+          parent->update_split_key(p, Redist::LEFT);
           if (p->_type != NodeType::LEAF) {
             p->_keys.erase(p->_keys.begin());
           }
@@ -612,22 +632,13 @@ public:
         // the removing may cascade
         if (is_right) {
           pos = parent->find_pos_low(right_min);
-
-          if (pos < parent->_keys.size()) {
-            std::cout << "debug pos=" << pos
-                      << ", keys size=" << parent->_keys.size()
-                      << ", key=" << key << std::endl;
-            level_visit();
-          }
-
           assert(pos < parent->_keys.size());
           if (p->_type != NodeType::LEAF) {
             p->_keys.emplace_back(parent->_keys[pos]);
           }
+
           parent->remove_key_by_pos(pos);
-          if (parent->_fields.size() > 2) {
-            parent->remove_fld_by_pos(pos + 1);
-          }
+          parent->remove_fld_by_pos(pos);
           p->move_right_half(sib, 0, p->_type == NodeType::LEAF);
           parent->update_split_key(sib, Redist::NONE);
           if (p == _leaf_beg) {
@@ -642,12 +653,10 @@ public:
           pos = parent->find_pos_low(right_min);
           assert(pos < parent->_keys.size());
           if (sib->_type != NodeType::LEAF) {
-            sib->_keys.emplace_back(parent->_keys[pos]);
+            p->_keys.insert(p->_keys.begin(), parent->_keys[pos]);
           }
           parent->remove_key_by_pos(pos);
-          if (parent->_fields.size() > 2) {
-            parent->remove_fld_by_pos(pos + 1);
-          }
+          parent->remove_fld_by_pos(pos + 1);
           p->move_left_half(sib, p->_keys.size());
           parent->update_split_key(sib, Redist::NONE);
 
@@ -659,10 +668,6 @@ public:
         if (parent == _root && parent->_keys.empty()) {
           _root = sib;
           _root->_parent.reset();
-          std::cout << "reset root, key size=" << _root->_keys.size()
-                    << ", key0=" << _root->_keys[0]
-                    << ", node type=" << (_root->_type == NodeType::LEAF)
-                    << std::endl;
           _root->_type = _root->_type == NodeType::LEAF ? NodeType::ROOT_LEAF
                                                         : NodeType::ROOT;
           --_height;
@@ -1108,8 +1113,8 @@ TEST(BPlusTreeTest, DISABLED_NormalBigTest) {
 
 TEST(BPlusTreeTest, NormalRandomTest) {
   auto rng = std::default_random_engine(time(0));
-  std::vector<u32> vals(10);
-  for (u32 i = 0; i < 10; ++i) {
+  std::vector<u32> vals(5000);
+  for (u32 i = 0; i < 5000; ++i) {
     vals[i] = i;
   }
   std::shuffle(vals.begin(), vals.end(), rng);
@@ -1132,6 +1137,53 @@ TEST(BPlusTreeTest, NormalRandomTest) {
 
   for (auto &i : vals) {
     EXPECT_EQ(tree.search(i, val), nullptr);
+  }
+}
+
+TEST(BPlusTreeTest, NormalRandomRWTest) {
+  std::map<u32, u32> mp; // For checking
+  auto rng = std::default_random_engine(time(0));
+  constexpr u32 sz = 50000;
+  std::vector<u32> vals(sz);
+  std::vector<u32> vals2(sz);
+  for (u32 i = 0; i < sz; ++i) {
+    vals[i] = i;
+    vals2[i] = i;
+  }
+  std::shuffle(vals.begin(), vals.end(), rng);
+  std::shuffle(vals2.begin(), vals2.end(), rng);
+
+  BPlusTree<u32, u32> tree;
+  u32 val;
+
+  for (i32 i = 0; i < sz; ++i) {
+    tree.remove(vals[i]);
+    mp.erase(vals[i]);
+    EXPECT_EQ(tree.search(vals[i], val), nullptr);
+    tree.insert(vals2[i], vals2[i]);
+    mp[vals2[i]] = vals2[i];
+    EXPECT_NE(tree.search(vals2[i], val), nullptr);
+  }
+
+  for (auto x : vals) {
+    if (mp.find(x) == mp.end()) {
+      EXPECT_EQ(tree.search(x, val), nullptr);
+    } else {
+      EXPECT_NE(tree.search(x, val), nullptr);
+    }
+  }
+
+  for (auto x : vals2) {
+    if (mp.find(x) == mp.end()) {
+      EXPECT_EQ(tree.search(x, val), nullptr);
+    } else {
+      EXPECT_NE(tree.search(x, val), nullptr);
+    }
+  }
+
+  for (auto x : vals) {
+    tree.remove(x);
+    EXPECT_EQ(tree.search(x, val), nullptr);
   }
 }
 
