@@ -74,9 +74,7 @@ enum class Redist { NONE = 0, LEFT, RIGHT };
 
 enum class ReqType { QUERY = 0, INSERT, DELETE };
 
-constexpr u16 _node_max_cap = 100;
-
-// #define USING_PARALLEL
+constexpr u16 _node_max_cap = 3;
 
 #ifdef USING_PARALLEL
 #define SL_TREE(mut) std::shared_lock<decltype(mut)> lk(mut);
