@@ -100,87 +100,6 @@ public:
 
 template <typename Key, typename Val>
 requires NodeCpt<Key, Val>
-class TLock {
-public:
-  TLock() { _read_count = 0; }
-  TLock(const TLock &other) = delete;
-  TLock &operator=(const TLock &other) = delete;
-  TLock(const TLock &&other) = delete;
-
-  void query(std::shared_ptr<Request<Key, Val>> req) {
-    {
-      const std::lock_guard<std::mutex> lk(_mut_r);
-      if (_read_count == 0) {
-        _mut_w.lock();
-      }
-      ++_read_count;
-    }
-
-    switch (req->_req_type) {
-    case ReqType::QUERY:
-      if (!_tree.search(req->_key, req->_val)) {
-        req->_msg << "FAIL: Key " << req->_key << " not found!";
-      } else {
-        req->_msg << "SUCC: Key " << req->_key << " found.";
-      }
-
-      break;
-    default:
-      req->_msg << "FAIL: Invalid request!";
-      break;
-    }
-
-    {
-      const std::lock_guard<std::mutex> lk(_mut_r);
-      if (--_read_count == 0) {
-        _mut_w.unlock();
-      }
-    }
-  }
-
-  void modify(std::shared_ptr<Request<Key, Val>> req) {
-    const std::lock_guard<std::mutex> lk(_mut_w);
-
-    switch (req->_req_type) {
-    case ReqType::INSERT:
-      _tree.insert(req->_key, req->_val);
-      req->_msg << "SUCC: Insertion finish.";
-      break;
-    case ReqType::DELETE:
-      _tree.remove(req->_key);
-      req->_msg << "SUCC: Deletion finish.";
-      break;
-    default:
-      req->_msg << "FAIL: Request type invalid!";
-      break;
-    }
-  }
-
-  std::future<void> solve(std::shared_ptr<Request<Key, Val>> req) {
-    switch (req->_req_type) {
-    case ReqType::QUERY:
-      return std::async(std::launch::async | std::launch::deferred,
-                        &TLock::query, this, req);
-      break;
-    case ReqType::INSERT:
-    case ReqType::DELETE:
-      return std::async(std::launch::async | std::launch::deferred,
-                        &TLock::modify, this, req);
-      break;
-    default:
-      req->_msg << "FAIL: Invalid request!";
-      return std::future<void>();
-    }
-  }
-
-  i32 _read_count;
-  std::mutex _mut_r;
-  std::mutex _mut_w;
-  BPlusTree<Key, Val> _tree;
-};
-
-template <typename Key, typename Val>
-requires NodeCpt<Key, Val>
 class BPlusTNode {
 public:
   BPlusTNode(NodeType type) { _type = type; }
@@ -1069,28 +988,7 @@ TEST(BPlusTreeTest, DISABLED_NormalTest) {
             << ", tree height=" << tree._height << std::endl;
 }
 
-TEST(BPlusTreeTest, DISABLED_ParallelTest) {
-  TLock<u32, u32> tl;
-  std::shared_ptr<Request<u32, u32>> req =
-      std::make_shared<Request<u32, u32>>(ReqType::QUERY, 3);
-  std::future<void> fut = tl.solve(req);
-  std::shared_ptr<Request<u32, u32>> req2 =
-      std::make_shared<Request<u32, u32>>(ReqType::INSERT, 3, 10);
-  std::future<void> fut2 = tl.solve(req2);
-  std::shared_ptr<Request<u32, u32>> req3 =
-      std::make_shared<Request<u32, u32>>(ReqType::QUERY, 3);
-  std::future<void> fut3 = tl.solve(req3);
-  fut.wait();
-  std::cout << "fut1 wait finish, msg=" << req->_msg.str()
-            << ", val=" << req->_val << std::endl;
-  fut2.wait();
-  std::cout << "fut2 wait finish, msg=" << req2->_msg.str() << std::endl;
-  fut3.wait();
-  std::cout << "fut2 wait finish, msg=" << req3->_msg.str()
-            << ", val=" << req3->_val << std::endl;
-}
-
-TEST(BPlusTreeTest, DISABLED_NormalBigTest) {
+TEST(BPlusTreeTest, NormalBigTest) {
   BPlusTree<u32, u32> tree;
   for (u32 i = 0; i < 100000; ++i) {
     tree.insert(i, i);
