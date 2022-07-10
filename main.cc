@@ -1,4 +1,5 @@
 #include "bplustree.hpp"
+#include "thread_pool.hpp"
 #include <iostream>
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <mutex>
 #include <queue>
 #include <random>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -79,11 +81,34 @@ enum class ReqType { QUERY = 0, INSERT, DELETE };
 
 constexpr u16 _node_max_cap = 3;
 
+// #define USING_PARALLEL
+
+#ifdef USING_PARALLEL
+#define SL_TREE(mut) std::shared_lock<decltype(mut)> lk(mut);
+#define SU_TREE(mut) mut.unlock_shared();
+#define SL_LEAF(mut) mut.lock_shared();
+#define SU_LEAF(mut) mut.unlock_shared();
+
+#define XL_TREE(mut) std::unique_lock<decltype(mut)> lk(mut);
+#define XU_TREE(mut) mut.unlock();
+#define XL_LEAF(mut) mut.lock();
+#define XU_LEAF(mut) mut.unlock();
+#else
+#define SL_TREE(mut)
+#define SU_TREE(mut)
+#define SL_LEAF(mut)
+#define SU_LEAF(mut)
+
+#define XL_TREE(mut)
+#define XU_TREE(mut)
+#define XL_LEAF(mut)
+#define XU_LEAF(mut)
+#endif
+
 constexpr bool too_few(u32 n) { return n < (_node_max_cap / 2); }
 
 constexpr bool too_much(u32 n) { return n > (_node_max_cap); }
 
-constexpr u32 req_msg_max_len = 512;
 template <typename Key, typename Val>
 requires NodeCpt<Key, Val>
 class Request {
@@ -383,8 +408,9 @@ public:
   }
 
   void insert(Key key, Val val) {
+    XL_TREE(_mut_rw)
     Val tmp_val;
-    auto tmp_p = search(key, tmp_val);
+    auto tmp_p = search(key, tmp_val, false);
     if (tmp_p) {
       // If exists, update with new val
       assert(static_cast<u32>(tmp_p->_type) & static_cast<u32>(NodeType::LEAF));
@@ -432,8 +458,9 @@ public:
     }
     u32 pos = p->find_pos(key);
     p->leaf_insert(key, val, pos);
-    if (!p->touch_high_limit())
+    if (!p->touch_high_limit()) {
       return;
+    }
 
     // When target node reaching high limit
     // Split and copy right min to parent, the parent
@@ -487,11 +514,13 @@ public:
   }
 
   void remove(Key key) {
+    XL_TREE(_mut_rw);
     Val val;
     u32 pos;
-    auto p = search(key, val);
-    if (!p)
+    auto p = search(key, val, false);
+    if (!p) {
       return;
+    }
 
     if (p->_type == NodeType::ROOT_LEAF) {
       bool exist = p->remove(key, &pos);
@@ -514,8 +543,9 @@ public:
 
     bool exist = p->remove(key, &pos);
     p->remove_fld_by_pos(pos);
-    if (!p->touch_low_limit())
+    if (!p->touch_low_limit()) {
       return;
+    }
     auto parent = p->_parent.lock();
 
     while (p != _root && too_few(p->_keys.size())) {
@@ -609,7 +639,10 @@ public:
     }
   }
 
-  node_type_t<Key, Val> search(Key key, Val &ret_val) {
+  node_type_t<Key, Val> search(Key key, Val &ret_val, bool need_lock = true) {
+    if (need_lock) {
+      SL_TREE(_mut_rw)
+    }
     auto p = _root;
     while (p &&
            !(static_cast<u32>(p->_type) & static_cast<u32>(NodeType::LEAF))) {
@@ -619,8 +652,9 @@ public:
     }
     assert(p);
     u32 pos = p->find_pos_exact(key);
-    if (pos >= p->_keys.size())
+    if (pos >= p->_keys.size()) {
       return nullptr;
+    }
     ret_val = std::get<Val>(p->_fields[pos]);
     return p;
   }
@@ -674,6 +708,8 @@ public:
   node_type_t<Key, Val> _root;
   node_type_t<Key, Val> _leaf_beg;
   u32 _height;
+
+  std::shared_mutex _mut_rw;
 };
 
 TEST(BPlusTreeTest, DISABLED_NormalTest) {
@@ -988,23 +1024,81 @@ TEST(BPlusTreeTest, DISABLED_NormalTest) {
             << ", tree height=" << tree._height << std::endl;
 }
 
-TEST(BPlusTreeTest, NormalBigTest) {
+TEST(BPlusTreeTest, DISABLED_NormalBigTest) {
   BPlusTree<u32, u32> tree;
-  for (u32 i = 0; i < 100000; ++i) {
+  constexpr u32 sz = 5000000;
+  for (u32 i = 0; i < sz; ++i) {
     tree.insert(i, i);
   }
 
   u32 val;
-  for (u32 i = 0; i < 100000; ++i) {
+  auto start = std::chrono::system_clock::now();
+  for (u32 i = 0; i < sz; ++i) {
     EXPECT_NE(tree.search(i, val), nullptr);
     EXPECT_EQ(val, i);
   }
+  auto end = std::chrono::system_clock::now();
+  std::cout << "Searching using "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(end -
+                                                                     start)
+                   .count()
+            << " ms" << std::endl;
 
-  for (u32 i = 0; i < 100000; ++i) {
+  for (u32 i = 0; i < sz; ++i) {
     tree.remove(i);
     EXPECT_EQ(tree.search(i, val), nullptr);
   }
-  for (u32 i = 0; i < 100000; ++i) {
+  for (u32 i = 0; i < sz; ++i) {
+    EXPECT_EQ(tree.search(i, val), nullptr);
+  }
+}
+
+TEST(BPlusTreeTest, DISABLED_ParallelBigTest) {
+  ThreadPool pool(4);
+  BPlusTree<u32, u32> tree;
+  constexpr u32 sz = 5000000;
+  std::vector<
+      std::future<decltype(std::declval<BPlusTree<u32, u32>>().insert(0, 0))>>
+      futs;
+  futs.reserve(sz);
+
+  for (u32 i = 0; i < sz; ++i) {
+    auto ret = pool.enqueue(&BPlusTree<u32, u32>::insert, &tree, i, i);
+    futs.emplace_back(std::move(ret));
+  }
+
+  u32 val;
+  for (u32 i = 0; i < sz; ++i) {
+    futs[i].wait();
+  }
+
+  std::vector<std::future<decltype(std::declval<BPlusTree<u32, u32>>().search(
+      0, val, true))>>
+      futs2;
+  futs2.reserve(sz);
+
+  auto start = std::chrono::system_clock::now();
+  for (u32 i = 0; i < sz; ++i) {
+    auto ret = pool.enqueue(&BPlusTree<u32, u32>::search, &tree, i, val, false);
+    futs2.emplace_back(std::move(ret));
+  }
+
+  for (u32 i = 0; i < sz; ++i) {
+    futs2[i].wait();
+  }
+
+  auto end = std::chrono::system_clock::now();
+  std::cout << "Searching using "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(end -
+                                                                     start)
+                   .count()
+            << " ms" << std::endl;
+
+  for (u32 i = 0; i < sz; ++i) {
+    tree.remove(i);
+    EXPECT_EQ(tree.search(i, val), nullptr);
+  }
+  for (u32 i = 0; i < sz; ++i) {
     EXPECT_EQ(tree.search(i, val), nullptr);
   }
 }
